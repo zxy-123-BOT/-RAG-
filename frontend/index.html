@@ -1,0 +1,789 @@
+<!doctype html>
+<!--
+年报 RAG 前端调试页面。
+
+页面职责:
+1. 提供问题输入框、股票代码和年份筛选框。
+2. 调用后端 POST /api/qa 获取最终答案和检索流程候选。
+3. 展示最终答案。
+4. 用折叠面板展示向量召回、BM25、RRF、rerank 等阶段的候选。
+5. 每个候选可继续展开，查看公司、年份、页码、分数、chunk 原文。
+
+关键 JS 函数:
+- initExamples: 渲染参考问题按钮。
+- ask: 读取用户输入，调用 /api/qa，并处理加载/错误状态。
+- renderResult: 渲染最终答案和检索流程。
+- renderBadges: 渲染识别到的公司、年份、候选数量等摘要标签。
+- renderPipeline: 按阶段渲染折叠栏。
+- renderCandidate: 渲染单条候选的折叠详情。
+- sortCandidates: 按当前阶段对应分数倒序排序。
+- escapeHtml: 防止 chunk 内容直接插入 HTML 时破坏页面结构。
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>年报 RAG 智能问答</title>
+  <style>
+    :root {
+      --bg: #f4f7fb;
+      --panel: rgba(255, 255, 255, 0.88);
+      --panel-solid: #ffffff;
+      --text: #172033;
+      --muted: #667085;
+      --line: #dce3ee;
+      --primary: #155eef;
+      --primary-2: #0b43b8;
+      --good: #087443;
+      --warn: #b54708;
+      --shadow: 0 18px 50px rgba(24, 39, 75, 0.12);
+      --radius: 16px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+      background:
+        radial-gradient(circle at 10% 0%, rgba(21, 94, 239, 0.10), transparent 34%),
+        linear-gradient(180deg, #f8fbff 0%, var(--bg) 48%, #eef3fa 100%);
+    }
+
+    .shell {
+      width: min(1180px, calc(100% - 40px));
+      margin: 0 auto;
+      padding: 36px 0 56px;
+    }
+
+    .hero {
+      display: grid;
+      gap: 18px;
+      margin-bottom: 22px;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      width: fit-content;
+      gap: 8px;
+      padding: 7px 11px;
+      border: 1px solid rgba(21, 94, 239, 0.18);
+      border-radius: 999px;
+      color: var(--primary-2);
+      background: rgba(255, 255, 255, 0.72);
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 36px;
+      line-height: 1.16;
+      letter-spacing: 0;
+    }
+
+    .subtitle {
+      max-width: 760px;
+      margin: 0;
+      color: var(--muted);
+      font-size: 16px;
+    }
+
+    .query-panel,
+    .answer-panel,
+    .stage-panel {
+      border: 1px solid rgba(220, 227, 238, 0.9);
+      border-radius: var(--radius);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+    }
+
+    .query-panel {
+      padding: 20px;
+      margin-bottom: 22px;
+    }
+
+    .query-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 14px;
+      align-items: stretch;
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 112px;
+      resize: vertical;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 16px;
+      color: var(--text);
+      background: var(--panel-solid);
+      font: inherit;
+      outline: none;
+      transition: border-color 0.16s ease, box-shadow 0.16s ease;
+    }
+
+    textarea:focus,
+    input:focus {
+      border-color: rgba(21, 94, 239, 0.72);
+      box-shadow: 0 0 0 4px rgba(21, 94, 239, 0.10);
+    }
+
+    .search-btn {
+      min-width: 132px;
+      border: 0;
+      border-radius: 14px;
+      color: white;
+      background: linear-gradient(180deg, var(--primary), var(--primary-2));
+      font: inherit;
+      font-weight: 800;
+      cursor: pointer;
+      box-shadow: 0 12px 26px rgba(21, 94, 239, 0.22);
+      transition: transform 0.16s ease, opacity 0.16s ease;
+    }
+
+    .search-btn:hover {
+      transform: translateY(-1px);
+    }
+
+    .search-btn:disabled {
+      cursor: not-allowed;
+      opacity: 0.62;
+      transform: none;
+    }
+
+    .filters {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(160px, 220px)) 1fr;
+      gap: 12px;
+      align-items: end;
+      margin-top: 14px;
+    }
+
+    label {
+      display: grid;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    input {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 11px 12px;
+      color: var(--text);
+      background: var(--panel-solid);
+      font: inherit;
+      outline: none;
+    }
+
+    .hint {
+      justify-self: end;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .examples {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 14px;
+    }
+
+    .chip {
+      border: 1px solid rgba(21, 94, 239, 0.16);
+      border-radius: 999px;
+      padding: 8px 11px;
+      color: #1d4ed8;
+      background: rgba(21, 94, 239, 0.06);
+      font-size: 13px;
+      cursor: pointer;
+    }
+
+    .status {
+      display: none;
+      align-items: center;
+      gap: 10px;
+      margin: 18px 0;
+      padding: 13px 15px;
+      border: 1px solid rgba(181, 71, 8, 0.18);
+      border-radius: 14px;
+      color: #7a2e0e;
+      background: #fff7ed;
+      font-size: 14px;
+    }
+
+    .status.active {
+      display: flex;
+    }
+
+    .spinner {
+      width: 18px;
+      height: 18px;
+      border: 3px solid rgba(181, 71, 8, 0.20);
+      border-top-color: var(--warn);
+      border-radius: 50%;
+      animation: spin 0.9s linear infinite;
+      flex: 0 0 auto;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    .answer-panel {
+      display: none;
+      margin-top: 22px;
+      overflow: hidden;
+    }
+
+    .answer-panel.visible {
+      display: block;
+    }
+
+    .answer-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 18px 20px 0;
+    }
+
+    .answer-title {
+      margin: 0;
+      font-size: 20px;
+    }
+
+    .badges {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+
+    .badge {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 6px 10px;
+      color: var(--muted);
+      background: white;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .answer-box {
+      margin: 16px 20px 20px;
+      padding: 20px;
+      min-height: 128px;
+      border: 1px solid rgba(8, 116, 67, 0.18);
+      border-radius: 14px;
+      background: linear-gradient(180deg, #f3fcf7, #ffffff);
+      color: #102a1d;
+      font-size: 18px;
+      line-height: 1.75;
+      white-space: pre-wrap;
+    }
+
+    .section-title {
+      margin: 28px 0 12px;
+      font-size: 18px;
+    }
+
+    .stage-stack {
+      display: grid;
+      gap: 12px;
+    }
+
+    details.stage-panel {
+      overflow: hidden;
+    }
+
+    summary {
+      cursor: pointer;
+      list-style: none;
+    }
+
+    summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .stage-summary {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 16px 18px;
+    }
+
+    .stage-name {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 16px;
+      font-weight: 850;
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--primary);
+      box-shadow: 0 0 0 5px rgba(21, 94, 239, 0.10);
+    }
+
+    .stage-meta {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .candidate-list {
+      display: grid;
+      gap: 10px;
+      padding: 0 18px 18px;
+    }
+
+    .candidate {
+      border: 1px solid var(--line);
+      border-radius: 13px;
+      background: white;
+      overflow: hidden;
+    }
+
+    .candidate-summary {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 12px;
+      align-items: center;
+      padding: 13px 14px;
+    }
+
+    .rank {
+      width: 34px;
+      height: 34px;
+      display: grid;
+      place-items: center;
+      border-radius: 10px;
+      color: var(--primary-2);
+      background: rgba(21, 94, 239, 0.08);
+      font-weight: 850;
+    }
+
+    .candidate-main {
+      min-width: 0;
+    }
+
+    .candidate-title {
+      display: block;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-weight: 800;
+    }
+
+    .candidate-sub {
+      display: block;
+      margin-top: 3px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .score {
+      color: var(--good);
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 13px;
+      font-weight: 850;
+    }
+
+    .candidate-body {
+      border-top: 1px solid var(--line);
+      padding: 14px;
+      display: grid;
+      gap: 12px;
+    }
+
+    .kv {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .kv div {
+      border: 1px solid #edf1f7;
+      border-radius: 10px;
+      padding: 9px;
+      background: #fbfcfe;
+      min-width: 0;
+    }
+
+    .kv span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 3px;
+    }
+
+    .kv strong {
+      display: block;
+      overflow-wrap: anywhere;
+      font-size: 13px;
+    }
+
+    .preview {
+      max-height: 260px;
+      overflow: auto;
+      border: 1px solid #edf1f7;
+      border-radius: 10px;
+      padding: 12px;
+      background: #fbfcfe;
+      color: #344054;
+      white-space: pre-wrap;
+      font-size: 13px;
+      line-height: 1.65;
+    }
+
+    .empty {
+      padding: 22px;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    .error {
+      display: none;
+      margin-top: 16px;
+      padding: 14px;
+      border: 1px solid rgba(180, 35, 24, 0.22);
+      border-radius: 14px;
+      color: #912018;
+      background: #fff3f0;
+    }
+
+    .error.visible {
+      display: block;
+    }
+
+    @media (max-width: 760px) {
+      .shell {
+        width: min(100% - 24px, 1180px);
+        padding-top: 22px;
+      }
+
+      h1 {
+        font-size: 28px;
+      }
+
+      .query-row,
+      .filters,
+      .kv {
+        grid-template-columns: 1fr;
+      }
+
+      .search-btn {
+        min-height: 48px;
+      }
+
+      .hint {
+        justify-self: start;
+      }
+
+      .answer-head,
+      .stage-summary {
+        flex-direction: column;
+        align-items: flex-start;
+      }
+
+      .badges {
+        justify-content: flex-start;
+      }
+
+      .candidate-summary {
+        grid-template-columns: auto 1fr;
+      }
+
+      .score {
+        grid-column: 2;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <div class="eyebrow">年报知识库 · RAG 调试工作台</div>
+      <h1>财报问答与检索链路可视化</h1>
+      <p class="subtitle">输入一个年报问题，系统会返回最终答案，并展开展示向量召回、BM25、RRF 融合和 rerank 精排各阶段候选。</p>
+    </section>
+
+    <section class="query-panel">
+      <div class="query-row">
+        <textarea id="question" placeholder="例如：良品铺子2020年营业收入是多少？"></textarea>
+        <button id="searchBtn" class="search-btn" onclick="ask()">搜索</button>
+      </div>
+
+      <div class="filters">
+        <label>
+          股票代码，可选
+          <input id="stockCode" placeholder="例如 603719" />
+        </label>
+        <label>
+          年份，可选
+          <input id="year" placeholder="例如 2020" />
+        </label>
+        <div class="hint">不填写时，后端会尝试从问题中自动识别。</div>
+      </div>
+
+      <div class="examples" id="examples"></div>
+    </section>
+
+    <div id="status" class="status">
+      <span class="spinner"></span>
+      <span>正在检索年报、重排序并生成答案，这一步可能需要几秒，请稍等。</span>
+    </div>
+
+    <div id="error" class="error"></div>
+
+    <section id="answerPanel" class="answer-panel">
+      <div class="answer-head">
+        <h2 class="answer-title">最终答案</h2>
+        <div id="badges" class="badges"></div>
+      </div>
+      <div id="answer" class="answer-box"></div>
+    </section>
+
+    <h2 id="pipelineTitle" class="section-title" style="display:none;">检索流程候选</h2>
+    <section id="pipeline" class="stage-stack"></section>
+  </main>
+
+  <script>
+    const examples = [
+      "良品铺子2020年营业收入是多少？",
+      "中芯国际2024年研发投入是多少？",
+      "智飞生物2023年营业收入和净利润是多少？",
+      "奥来德2024年主要产品有哪些？"
+    ];
+
+    const stageDefs = [
+      { key: "vector_recall", name: "向量召回", scoreKey: "vector_score", desc: "FAISS 语义相似度召回" },
+      { key: "bm25_recall", name: "BM25 召回", scoreKey: "bm25_score", desc: "关键词匹配召回" },
+      { key: "rrf_fusion", name: "RRF 融合", scoreKey: "rrf_score", desc: "融合向量和 BM25 排名" },
+      { key: "rerank_input", name: "Rerank 输入", scoreKey: "rrf_score", desc: "送入精排模型前的候选" },
+      { key: "rerank", name: "Rerank 精排", scoreKey: "rerank_score", desc: "精排后进入最终上下文的候选" }
+    ];
+
+    const els = {
+      question: document.getElementById("question"),
+      stockCode: document.getElementById("stockCode"),
+      year: document.getElementById("year"),
+      searchBtn: document.getElementById("searchBtn"),
+      status: document.getElementById("status"),
+      error: document.getElementById("error"),
+      answerPanel: document.getElementById("answerPanel"),
+      answer: document.getElementById("answer"),
+      badges: document.getElementById("badges"),
+      pipelineTitle: document.getElementById("pipelineTitle"),
+      pipeline: document.getElementById("pipeline"),
+      examples: document.getElementById("examples")
+    };
+
+    initExamples();
+
+    function initExamples() {
+      els.examples.innerHTML = examples.map((text, index) => (
+        `<button class="chip" type="button" data-example="${index}">${escapeHtml(text)}</button>`
+      )).join("");
+      document.querySelectorAll("[data-example]").forEach(button => {
+        button.addEventListener("click", () => {
+          els.question.value = examples[Number(button.dataset.example)];
+          els.question.focus();
+        });
+      });
+    }
+
+    async function ask() {
+      const question = els.question.value.trim();
+      if (!question) {
+        showError("请先输入一个问题。");
+        return;
+      }
+
+      setLoading(true);
+      clearError();
+
+      const payload = {
+        question,
+        stock_code: blankToNull(els.stockCode.value),
+        year: blankToNull(els.year.value),
+        include_content: true,
+        content_preview_chars: 1200
+      };
+
+      try {
+        const res = await fetch("/api/qa", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.detail || "请求失败");
+        }
+        renderResult(data);
+      } catch (err) {
+        showError(err.message || String(err));
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    function renderResult(data) {
+      els.answerPanel.classList.add("visible");
+      els.answer.textContent = data.answer || "未返回答案。";
+      renderBadges(data);
+      renderPipeline(data.pipeline || {});
+    }
+
+    function renderBadges(data) {
+      const filters = data.filters || {};
+      const usage = data.usage || {};
+      const resolvedYears = Array.isArray(filters.resolved_years) && filters.resolved_years.length
+        ? filters.resolved_years.join(", ")
+        : filters.resolved_year;
+      const badges = [
+        ["股票代码", filters.resolved_stock_code || "未限定"],
+        ["年份", resolvedYears || "未限定"],
+        ["向量", usage.vector_count ?? 0],
+        ["BM25", usage.bm25_count ?? 0],
+        ["精排", usage.rerank_output_count ?? 0],
+        ["上下文字符", usage.context_chars ?? 0]
+      ];
+      els.badges.innerHTML = badges.map(([k, v]) => `<span class="badge">${escapeHtml(k)}：${escapeHtml(v)}</span>`).join("");
+    }
+
+    function renderPipeline(pipeline) {
+      els.pipelineTitle.style.display = "block";
+      els.pipeline.innerHTML = stageDefs.map((stage, index) => {
+        const rawItems = Array.isArray(pipeline[stage.key]) ? pipeline[stage.key] : [];
+        const items = sortCandidates(rawItems, stage.scoreKey);
+        const open = index === 0 ? "open" : "";
+        const body = items.length
+          ? items.map((item, itemIndex) => renderCandidate(item, stage, itemIndex + 1)).join("")
+          : `<div class="empty">这个阶段没有候选。</div>`;
+
+        return `
+          <details class="stage-panel" ${open}>
+            <summary class="stage-summary">
+              <span class="stage-name"><span class="dot"></span>${escapeHtml(stage.name)}</span>
+              <span class="stage-meta">${escapeHtml(stage.desc)} · ${items.length} 条候选 · 按 ${escapeHtml(stage.scoreKey)} 倒序</span>
+            </summary>
+            <div class="candidate-list">${body}</div>
+          </details>
+        `;
+      }).join("");
+    }
+
+    function renderCandidate(item, stage, displayRank) {
+      const meta = item.meta || {};
+      const scores = item.scores || {};
+      const score = scores[stage.scoreKey];
+      const title = [
+        meta.company_name || "未知公司",
+        meta.year || "未知年份",
+        meta.chunk_type || "chunk"
+      ].join(" · ");
+      const sub = `${item.chunk_id || ""} · ${meta.section || "未识别章节"}`;
+      const page = formatPage(meta.page_start, meta.page_end);
+      const content = item.content || item.content_preview || "无内容预览";
+
+      return `
+        <details class="candidate">
+          <summary class="candidate-summary">
+            <span class="rank">${displayRank}</span>
+            <span class="candidate-main">
+              <span class="candidate-title">${escapeHtml(title)}</span>
+              <span class="candidate-sub">${escapeHtml(sub)}</span>
+            </span>
+            <span class="score">${escapeHtml(stage.scoreKey)}=${formatScore(score)}</span>
+          </summary>
+          <div class="candidate-body">
+            <div class="kv">
+              <div><span>公司</span><strong>${escapeHtml(meta.company_name || "-")}</strong></div>
+              <div><span>股票代码</span><strong>${escapeHtml(meta.stock_code || "-")}</strong></div>
+              <div><span>年份</span><strong>${escapeHtml(meta.year || "-")}</strong></div>
+              <div><span>页码</span><strong>${escapeHtml(page)}</strong></div>
+              <div><span>chunk_id</span><strong>${escapeHtml(item.chunk_id || "-")}</strong></div>
+              <div><span>vector_id</span><strong>${escapeHtml(item.vector_id ?? "-")}</strong></div>
+              <div><span>来源阶段</span><strong>${escapeHtml(item.source_stage || "-")}</strong></div>
+              <div><span>召回来源</span><strong>${escapeHtml((item.sources || []).join(", ") || "-")}</strong></div>
+            </div>
+            <div class="kv">
+              <div><span>vector_score</span><strong>${formatScore(scores.vector_score)}</strong></div>
+              <div><span>bm25_score</span><strong>${formatScore(scores.bm25_score)}</strong></div>
+              <div><span>rrf_score</span><strong>${formatScore(scores.rrf_score)}</strong></div>
+              <div><span>rerank_score</span><strong>${formatScore(scores.rerank_score)}</strong></div>
+            </div>
+            <div class="preview">${escapeHtml(content)}</div>
+          </div>
+        </details>
+      `;
+    }
+
+    function sortCandidates(items, scoreKey) {
+      return [...items].sort((a, b) => {
+        const av = Number(a?.scores?.[scoreKey] ?? -Infinity);
+        const bv = Number(b?.scores?.[scoreKey] ?? -Infinity);
+        return bv - av;
+      });
+    }
+
+    function formatPage(start, end) {
+      if (!start && !end) return "-";
+      return start === end || !end ? String(start) : `${start}-${end}`;
+    }
+
+    function formatScore(value) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return "-";
+      return Number(value).toFixed(4);
+    }
+
+    function blankToNull(value) {
+      const clean = String(value || "").trim();
+      return clean ? clean : null;
+    }
+
+    function setLoading(isLoading) {
+      els.searchBtn.disabled = isLoading;
+      els.searchBtn.textContent = isLoading ? "检索中..." : "搜索";
+      els.status.classList.toggle("active", isLoading);
+    }
+
+    function showError(message) {
+      els.error.textContent = message;
+      els.error.classList.add("visible");
+    }
+
+    function clearError() {
+      els.error.textContent = "";
+      els.error.classList.remove("visible");
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+  </script>
+</body>
+</html>
